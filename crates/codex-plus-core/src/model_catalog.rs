@@ -604,14 +604,34 @@ fn model_ui_metadata_map(models: &[String]) -> Value {
     model_ui_metadata_map_with_overrides(models, "")
 }
 
-fn model_ui_metadata_map_with_overrides(models: &[String], user_json: &str) -> Value {
-    let user: Value = serde_json::from_str(user_json).unwrap_or(Value::Null);
+fn parse_normalized_user_metadata(user_json: &str) -> Map<String, Value> {
+    let mut canonical = Map::new();
+    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(user_json) else {
+        return canonical;
+    };
+    for (key, value) in entries {
+        if !value.is_object() {
+            continue;
+        }
+        let normalized = crate::model_suffix::parse_model_suffix(&key)
+            .0
+            .trim()
+            .to_ascii_lowercase();
+        if !normalized.is_empty() {
+            canonical.insert(normalized, value);
+        }
+    }
+    canonical
+}
+
+fn model_ui_metadata_map_from_parsed(models: &[String], user_map: &Map<String, Value>) -> Value {
     let mut metadata = Map::new();
     for model in models {
-        let slug = crate::model_suffix::parse_model_suffix(model).0;
-        let user_override = user.as_object().and_then(|entries| entries.iter()
-            .find(|(key, value)| value.is_object() && crate::model_suffix::parse_model_suffix(key).0.eq_ignore_ascii_case(&slug))
-            .map(|(_, value)| value));
+        let slug = crate::model_suffix::parse_model_suffix(model)
+            .0
+            .trim()
+            .to_ascii_lowercase();
+        let user_override = user_map.get(&slug);
         if let Some(value) = crate::model_suffix::model_ui_metadata_with_override(model, user_override) {
             metadata.insert(model.clone(), value);
         }
@@ -619,8 +639,20 @@ fn model_ui_metadata_map_with_overrides(models: &[String], user_json: &str) -> V
     Value::Object(metadata)
 }
 
+fn model_ui_metadata_map_with_overrides(models: &[String], user_json: &str) -> Value {
+    let user_map = parse_normalized_user_metadata(user_json);
+    model_ui_metadata_map_from_parsed(models, &user_map)
+}
+
 fn relay_profile_model_ui_metadata_map(profile: &RelayProfile, models: &[String]) -> Value {
-    let mut metadata = model_ui_metadata_map_with_overrides(models, &profile.model_metadata)
+    let mut effective_user_map = parse_normalized_user_metadata(&profile.model_metadata);
+    if profile.relay_mode != crate::settings::RelayMode::Aggregate {
+        crate::aggregate_catalog::merge_gpt62_fast_defaults(
+            models.iter().map(String::as_str),
+            &mut effective_user_map,
+        );
+    }
+    let mut metadata = model_ui_metadata_map_from_parsed(models, &effective_user_map)
         .as_object().cloned().unwrap_or_default();
     let windows: std::collections::BTreeMap<String, String> =
         serde_json::from_str::<Value>(&profile.model_windows)
@@ -700,6 +732,48 @@ mod window_override_tests {
         let metadata = relay_profile_model_ui_metadata_map(&RelayProfile::default(), &models);
         assert!(metadata["gpt-5.5"]["contextWindow"].as_u64().is_some());
         assert!(metadata.get("vendor-model").is_none());
+    }
+
+    #[test]
+    fn gpt62_direct_profile_exposes_fast_tiers_and_honors_unsupported_override() {
+        let models = vec!["gpt-6.2-sol".to_string(), "gpt-6.2-astra".to_string()];
+        let default_profile = RelayProfile {
+            relay_mode: crate::settings::RelayMode::Official,
+            official_mix_api_key: true,
+            model_metadata: r#"{"gpt-6.2-sol":{"default_reasoning_level":"high"}}"#.into(),
+            ..Default::default()
+        };
+        let metadata = relay_profile_model_ui_metadata_map(&default_profile, &models);
+        assert_eq!(metadata["gpt-6.2-sol"]["serviceTiers"][0]["id"], "priority");
+        assert_eq!(
+            metadata["gpt-6.2-sol"]["additionalSpeedTiers"],
+            json!(["fast"])
+        );
+        assert_eq!(metadata["gpt-6.2-sol"]["defaultReasoningEffort"], "high");
+        assert_eq!(
+            metadata["gpt-6.2-astra"]["serviceTiers"][0]["id"],
+            "priority"
+        );
+        assert_eq!(
+            metadata["gpt-6.2-astra"]["additionalSpeedTiers"],
+            json!(["fast"])
+        );
+
+        let suppressed_profile = RelayProfile {
+            model_metadata: r#"{"gpt-6.2-sol":{"codex_plus_fast_support":"unsupported"}}"#.into(),
+            ..default_profile
+        };
+        let suppressed = relay_profile_model_ui_metadata_map(&suppressed_profile, &models);
+        assert_eq!(suppressed["gpt-6.2-sol"]["serviceTiers"], json!([]));
+        assert_eq!(
+            suppressed["gpt-6.2-sol"]["additionalSpeedTiers"],
+            json!([])
+        );
+        assert_eq!(suppressed["gpt-6.2-sol"]["prioritySupportOverride"], false);
+        assert_eq!(
+            suppressed["gpt-6.2-astra"]["serviceTiers"][0]["id"],
+            "priority"
+        );
     }
 }
 

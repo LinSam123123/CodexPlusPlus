@@ -4635,10 +4635,49 @@ pub fn migrate_managed_model_catalog_pointer_in_home(
     let models = catalog.get_mut("models").and_then(Value::as_array_mut)
         .ok_or_else(|| anyhow::anyhow!("待升级模型目录缺少 models 数组"))?;
     let mut context_changed = false;
-    for model in models {
+    for model in models.iter_mut() {
         if model.get("max_context_window").is_some_and(Value::is_number) {
             model["max_context_window"] = Value::Null;
             context_changed = true;
+        }
+    }
+    let mut fast_tiers_backfilled = false;
+    let active_profile = settings.active_relay_profile();
+    let active_filename = format!("{}.json", sanitize_catalog_filename(&active_profile.id));
+    if settings.active_aggregate_relay_profile().is_none()
+        && active_profile.relay_mode != RelayMode::Aggregate
+        && Path::new(filename) == Path::new(&active_filename)
+    {
+        let user_overrides =
+            parse_model_metadata_map(&active_profile.model_metadata).unwrap_or_default();
+        for model in models.iter_mut() {
+            let Some(slug) = model.get("slug").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let Some(defaults) = crate::aggregate_catalog::gpt62_fast_default_for_slug(&slug)
+            else {
+                continue;
+            };
+            let user_override = model_metadata_override_for_slug(&user_overrides, &slug);
+            let explicitly_configured = user_override.is_some_and(|fields| {
+                fields.get("service_tiers").is_some()
+                    || fields.get("additional_speed_tiers").is_some()
+                    || fields.get("codex_plus_fast_support").and_then(Value::as_str)
+                        == Some("unsupported")
+            });
+            if explicitly_configured {
+                continue;
+            }
+            let empty_or_missing = |key: &str| {
+                model
+                    .get(key)
+                    .is_none_or(|value| value.is_null() || value.as_array().is_some_and(Vec::is_empty))
+            };
+            if empty_or_missing("service_tiers") && empty_or_missing("additional_speed_tiers") {
+                model["service_tiers"] = defaults["service_tiers"].clone();
+                model["additional_speed_tiers"] = defaults["additional_speed_tiers"].clone();
+                fast_tiers_backfilled = true;
+            }
         }
     }
     let relative = if context_changed {
@@ -4662,10 +4701,15 @@ pub fn migrate_managed_model_catalog_pointer_in_home(
         }
         migrated
     } else {
+        if fast_tiers_backfilled {
+            let updated_bytes = serde_json::to_vec_pretty(&catalog)?;
+            crate::settings::atomic_write(&catalog_path, &updated_bytes)
+                .context("回填升级后的模型目录失败")?;
+        }
         relative.to_path_buf()
     };
     let pointer = managed_catalog_pointer(home, &relative.to_string_lossy(), &contents)?;
-    if raw_path == pointer { return Ok(false); }
+    if raw_path == pointer { return Ok(fast_tiers_backfilled); }
     doc["model_catalog_json"] = toml_edit::value(pointer);
     crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())
         .context("更新升级后的模型目录指针失败")?;
@@ -4726,7 +4770,7 @@ fn apply_model_catalog_to_config_with_live_policy(
     let model_auto_compact =
         parse_model_string_map(&profile.model_auto_compact, "model_auto_compact")?;
     validate_model_auto_compact(&model_auto_compact)?;
-    let model_metadata = parse_model_metadata_map(&profile.model_metadata)?;
+    let mut model_metadata = parse_model_metadata_map(&profile.model_metadata)?;
     // 供应商级 Multi-Agent 显式选择（#2683）：只认 v1/v2，其余值一律按 Auto 落回现有行为。
     // 在所有 catalog 分支（含外部目录早退）之前计算：显式 v1 的闸门压下动作对
     // 外部目录路径同样生效，否则用户手写目录里的 v1 声明也会被 [features] 闸门
@@ -4900,6 +4944,11 @@ fn apply_model_catalog_to_config_with_live_policy(
     // 但强制落盘只对「用户显式写了模型列表」的形态生效：模型列表留空时 catalog
     // 只有 0~1 个条目，会替换 Codex 内置的官方模型列表（选择器变空）——Mixed API
     // （官方登录+API）走同一条链路且字段可见，必须沿用上面的空列表保护。
+    let has_gpt62_fast_entries = !model_list.trim().is_empty()
+        && profile.relay_mode != RelayMode::Aggregate
+        && entries.iter().any(|entry| {
+            crate::aggregate_catalog::gpt62_fast_default_for_slug(&entry.slug).is_some()
+        });
     if !should_write_managed_model_catalog(
         &entries,
         has_metadata_overrides,
@@ -4913,6 +4962,7 @@ fn apply_model_catalog_to_config_with_live_policy(
     ) && provider_multi_agent.is_none()
         && !upstream_rejects_tool_search(profile)
         && !existing_managed_catalog
+        && !has_gpt62_fast_entries
     {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json")
@@ -4937,6 +4987,12 @@ fn apply_model_catalog_to_config_with_live_policy(
         provider_multi_agent,
     );
     let catalog_json = top_level.fold_compact_limit_into_catalog(&catalog_json, &entries)?;
+    if profile.relay_mode != RelayMode::Aggregate {
+        crate::aggregate_catalog::merge_gpt62_fast_defaults(
+            entries.iter().map(|entry| entry.slug.as_str()),
+            &mut model_metadata,
+        );
+    }
     let catalog_json = apply_model_metadata_overrides(&catalog_json, &model_metadata)?;
     let catalog_json =
         crate::gateway::opencode::apply_hy4_catalog_json_metadata(profile, &catalog_json)?;

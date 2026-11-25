@@ -490,3 +490,212 @@ fn wsl_aggregate_catalog_pointer_stays_relative() {
     );
     assert!(temp.path().join(&actual).is_file(), "{actual:?}");
 }
+
+struct CodexHomeEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl CodexHomeEnvGuard {
+    fn set(path: &Path) -> Self {
+        let previous = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", path);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for CodexHomeEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+}
+
+fn find_catalog_model<'a>(catalog: &'a serde_json::Value, slug: &str) -> &'a serde_json::Value {
+    catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == slug)
+        .unwrap_or_else(|| panic!("catalog 缺少模型 {slug}"))
+}
+
+#[test]
+fn direct_profile_gpt62_models_get_fast_tiers_and_honor_unsupported_override() {
+    let _lock = crate::common::global_state_lock();
+    let home = tempfile::tempdir().unwrap();
+    let _guard = CodexHomeEnvGuard::set(home.path());
+
+    let mut mix_profile = RelayProfile {
+        id: "direct-mix".to_string(),
+        relay_mode: RelayMode::Official,
+        official_mix_api_key: true,
+        upstream_base_url: "https://relay.example/v1".to_string(),
+        api_key: "sk-mix-test".to_string(),
+        model: "gpt-6.2-sol".to_string(),
+        model_list: "gpt-6.2-sol\ngpt-6.2-astra\ngpt-6.2-unknown".to_string(),
+        model_metadata: serde_json::json!({
+            "gpt-6.2-sol": {
+                "supported_reasoning_levels": [
+                    { "effort": "high", "description": "Greater reasoning depth" }
+                ],
+                "default_reasoning_level": "high"
+            }
+        })
+        .to_string(),
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_to_home_with_switch_rules(home.path(), &mix_profile, "").unwrap();
+    let catalog: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(pointer(home.path())).unwrap()).unwrap();
+    for slug in ["gpt-6.2-sol", "gpt-6.2-astra"] {
+        let model = find_catalog_model(&catalog, slug);
+        assert_eq!(model["service_tiers"][0]["id"], "priority", "{slug}");
+        assert_eq!(
+            model["additional_speed_tiers"],
+            serde_json::json!(["fast"]),
+            "{slug}"
+        );
+    }
+    assert_eq!(find_catalog_model(&catalog, "gpt-6.2-sol")["default_reasoning_level"], "high");
+    assert_eq!(
+        find_catalog_model(&catalog, "gpt-6.2-unknown")["service_tiers"],
+        serde_json::json!([])
+    );
+
+    // 显式禁用 Fast 时必须清除 priority / fast。
+    mix_profile.model_metadata =
+        r#"{"gpt-6.2-sol":{"codex_plus_fast_support":"unsupported"}}"#.to_string();
+    apply_relay_profile_to_home_with_switch_rules(home.path(), &mix_profile, "").unwrap();
+    let suppressed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(pointer(home.path())).unwrap()).unwrap();
+    assert_eq!(
+        find_catalog_model(&suppressed, "gpt-6.2-sol")["service_tiers"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        find_catalog_model(&suppressed, "gpt-6.2-sol")["additional_speed_tiers"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        find_catalog_model(&suppressed, "gpt-6.2-astra")["service_tiers"][0]["id"],
+        "priority"
+    );
+
+    // 纯平铺 PureApi 列表（无窗口/元数据）也应为 gpt-6.2-sol / gpt-6.2-astra 写入托管目录与 Fast 档位。
+    let flat_home = tempfile::tempdir().unwrap();
+    let flat_profile = RelayProfile {
+        id: "flat-direct".to_string(),
+        relay_mode: RelayMode::PureApi,
+        base_url: "https://relay.example/v1".to_string(),
+        api_key: "sk-flat-test".to_string(),
+        model: "gpt-6.2-sol".to_string(),
+        model_list: "gpt-6.2-sol\ngpt-6.2-astra".to_string(),
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_to_home_with_switch_rules(flat_home.path(), &flat_profile, "").unwrap();
+    assert_absolute_managed_pointer(flat_home.path(), "flat-direct");
+    let flat_catalog: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(pointer(flat_home.path())).unwrap()).unwrap();
+    assert_eq!(
+        find_catalog_model(&flat_catalog, "gpt-6.2-sol")["service_tiers"][0]["id"],
+        "priority"
+    );
+}
+
+#[test]
+fn startup_migration_backfills_gpt62_fast_tiers_idempotently() {
+    let _lock = crate::common::global_state_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = CodexHomeEnvGuard::set(temp.path());
+
+    std::fs::create_dir_all(temp.path().join("model-catalogs")).unwrap();
+    let catalog_path = temp.path().join("model-catalogs/direct-gpt62.json");
+    let legacy_catalog = serde_json::json!({
+        "models": [
+            {
+                "slug": "gpt-6.2-sol",
+                "display_name": "gpt-6.2-sol",
+                "max_context_window": null,
+                "service_tiers": [],
+                "additional_speed_tiers": []
+            },
+            {
+                "slug": "gpt-6.2-astra",
+                "display_name": "gpt-6.2-astra",
+                "max_context_window": null,
+                "service_tiers": [],
+                "additional_speed_tiers": []
+            },
+            {
+                "slug": "gpt-6.2-unknown",
+                "display_name": "gpt-6.2-unknown",
+                "max_context_window": null,
+                "service_tiers": [],
+                "additional_speed_tiers": []
+            }
+        ]
+    });
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy_catalog).unwrap();
+    std::fs::write(&catalog_path, &legacy_bytes).unwrap();
+    write_pointer(temp.path(), &catalog_path);
+
+    let profile = RelayProfile {
+        id: "direct-gpt62".to_string(),
+        relay_mode: RelayMode::Official,
+        official_mix_api_key: true,
+        model: "gpt-6.2-sol".to_string(),
+        model_list: "gpt-6.2-sol\ngpt-6.2-astra\ngpt-6.2-unknown".to_string(),
+        ..RelayProfile::default()
+    };
+    let mut settings = BackendSettings {
+        relay_profiles_enabled: true,
+        active_relay_id: "direct-gpt62".to_string(),
+        relay_profiles: vec![profile],
+        ..BackendSettings::default()
+    };
+
+    assert!(migrate_managed_model_catalog_pointer_in_home(temp.path(), &settings).unwrap());
+    let migrated: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+    for slug in ["gpt-6.2-sol", "gpt-6.2-astra"] {
+        let model = find_catalog_model(&migrated, slug);
+        assert_eq!(model["service_tiers"][0]["id"], "priority", "{slug}");
+        assert_eq!(
+            model["additional_speed_tiers"],
+            serde_json::json!(["fast"]),
+            "{slug}"
+        );
+    }
+    assert_eq!(
+        find_catalog_model(&migrated, "gpt-6.2-unknown")["service_tiers"],
+        serde_json::json!([])
+    );
+
+    // 幂等：二次调用不再改写。
+    assert!(!migrate_managed_model_catalog_pointer_in_home(temp.path(), &settings).unwrap());
+
+    // 若用户明确标为 unsupported，旧目录中的空数组保持原样不回填。
+    std::fs::write(&catalog_path, &legacy_bytes).unwrap();
+    settings.relay_profiles[0].model_metadata = serde_json::json!({
+        "gpt-6.2-sol": { "codex_plus_fast_support": "unsupported" },
+        "gpt-6.2-astra": { "service_tiers": [] }
+    })
+    .to_string();
+    assert!(!migrate_managed_model_catalog_pointer_in_home(temp.path(), &settings).unwrap());
+    let preserved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&catalog_path).unwrap()).unwrap();
+    assert_eq!(
+        find_catalog_model(&preserved, "gpt-6.2-sol")["service_tiers"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        find_catalog_model(&preserved, "gpt-6.2-astra")["service_tiers"],
+        serde_json::json!([])
+    );
+}

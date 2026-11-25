@@ -867,6 +867,42 @@ fn official_fast_defaults() -> &'static Map<String, Value> {
     })
 }
 
+/// 返回 GPT-6.2 已知型号的默认 Fast 档位定义（已有内置或本机缓存精确条目时跳过）。
+pub(crate) fn gpt62_fast_default_for_slug(slug: &str) -> Option<&'static Value> {
+    let normalized = crate::model_suffix::parse_model_suffix(slug)
+        .0
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.is_empty() || crate::model_suffix::requires_bundled_metadata_catalog(&normalized) {
+        return None;
+    }
+    official_fast_defaults().get(&normalized)
+}
+
+/// 为尚未显式声明 `service_tiers` / `additional_speed_tiers` 的 GPT-6.2 已知型号补入默认 Fast 档位。
+pub(crate) fn merge_gpt62_fast_defaults<'a>(
+    slugs: impl IntoIterator<Item = &'a str>,
+    metadata: &mut Map<String, Value>,
+) {
+    for raw_slug in slugs {
+        let slug = crate::model_suffix::parse_model_suffix(raw_slug)
+            .0
+            .trim()
+            .to_ascii_lowercase();
+        let Some(defaults) = gpt62_fast_default_for_slug(&slug) else {
+            continue;
+        };
+        let fields = metadata.entry(slug).or_insert_with(|| json!({}));
+        if !fields.is_object() {
+            *fields = json!({});
+        }
+        if fields.get("service_tiers").is_none() && fields.get("additional_speed_tiers").is_none() {
+            fields["service_tiers"] = defaults["service_tiers"].clone();
+            fields["additional_speed_tiers"] = defaults["additional_speed_tiers"].clone();
+        }
+    }
+}
+
 pub(crate) fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Value> {
     let entries = profile_catalog_entries(profile)?;
     if entries.is_empty() {
@@ -886,22 +922,7 @@ pub(crate) fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Val
     // 官方池成员同步的是模型 ID，不一定有同版本的本机目录。只补已知型号的
     // 官方 Fast 档位，不把同家族旧模板的能力移给未知型号或第三方供应商。
     if crate::official_login::member_uses_official_login_transport(profile) {
-        let fast_defaults = official_fast_defaults();
-        for entry in &entries {
-            let slug = entry.slug.to_ascii_lowercase();
-            let Some(defaults) = fast_defaults.get(&slug) else {
-                continue;
-            };
-            if crate::model_suffix::requires_bundled_metadata_catalog(&slug) {
-                continue;
-            }
-            let fields = metadata.entry(slug).or_insert_with(|| json!({}));
-            if fields.get("service_tiers").is_none() && fields.get("additional_speed_tiers").is_none()
-            {
-                fields["service_tiers"] = defaults["service_tiers"].clone();
-                fields["additional_speed_tiers"] = defaults["additional_speed_tiers"].clone();
-            }
-        }
+        merge_gpt62_fast_defaults(entries.iter().map(|entry| entry.slug.as_str()), &mut metadata);
     }
     let catalog_json =
         crate::relay_config::apply_model_metadata_overrides(&catalog_json, &metadata)?;
